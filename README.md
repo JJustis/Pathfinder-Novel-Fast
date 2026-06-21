@@ -247,3 +247,175 @@ This bidirectional propagation is the core of the hierarchical Bayesian inferenc
 ## 12. Conclusion
 
 The Deep Observation framework provides a mathematically rigorous approach to autonomous navigation under uncertainty. By fusing multi-scale observations, propagating information bidirectionally, and exploring uncertain regions, the agent builds an accurate belief map and reliably reaches its goal. The mathematics is transparent, the architecture is modular, and the principles extend to any domain where sensors provide noisy, multi-resolution data.
+
+___________________________________________________________________________________________________________________________________________________
+Below is a **block diagram** of the **Deep Observation Pathfinding** framework. It shows the main components and the flow of information between them, as described in the mathematical formulation.
+
+---
+
+## Block Diagram
+
+```
++---------------------+
+|   ENVIRONMENT       |
+|  (True Occupancy)   |
++---------------------+
+           |
+           | noisy observations at radii R2,R1,R0
+           v
++---------------------+     +---------------------+
+|  OBSERVATION LAYER  |     |  OBSERVATION LAYER  |     +---------------------+
+|     (Layer 0)       |     |     (Layer 1)       |     |  OBSERVATION LAYER  |
+|   R=2, σ²=0.05      |     |   R=4, σ²=0.10     |     |     (Layer 2)       |
+|   fine, precise     |     |   middle            |     |   R=8, σ²=0.20     |
++---------------------+     +---------------------+     |   coarse, noisy    |
+           |                         |                         |                  |
+           |                         |                         |                  |
+           v                         v                         v                  |
++---------------------+     +---------------------+     +---------------------+  |
+|  BELIEF MAP b^(0)   |     |  BELIEF MAP b^(1)   |     |  BELIEF MAP b^(2)   |  |
+|   prior = 0.5       |     |   prior = 0.5       |     |   prior = 0.5       |  |
++---------------------+     +---------------------+     +---------------------+  |
+           |                         |                         |                  |
+           |                         |                         |                  |
+           +------------+------------+-------------------------+                  |
+                        |             |                                           |
+                        |             |                                           |
+                        v             v                                           |
+           +---------------------------+                                         |
+           |    UPWARD PASS            |                                         |
+           |  (fine → coarse)          |                                         |
+           |  b^(i)_post = ...         |                                         |
+           +---------------------------+                                         |
+                        |                                                       |
+                        v                                                       |
+           +---------------------------+                                         |
+           |    DOWNWARD PASS          |                                         |
+           |  (coarse → fine)          |                                         |
+           |  b^(i)_refined = ...      |                                         |
+           +---------------------------+                                         |
+                        |                                                       |
+                        |                                                       |
+                        v                                                       |
+           +---------------------------+                                         |
+           |  FUSED BELIEF MAP         |                                         |
+           |  b_fused = b^(0)_refined  |                                         |
+           +---------------------------+                                         |
+                        |                                                       |
+            +-----------+----------+--------------------------------------------+
+            |                      |
+            v                      v
++---------------------------+   +---------------------------+
+|   PATH PLANNING (A*)     |   |  UNCERTAINTY-DRIVEN      |
+|   threshold τ = 0.45     |   |  EXPLORATION             |
+|   cost: g + h            |   |  u = b(1-b)              |
++---------------------------+   |  p_next = argmax(u+ε)   |
+            |                      +---------------------------+
+            |                                  |
+            |                                  |
+            v                                  |
+   +---------------------+                    |
+   |   PATH FOUND?       |                    |
+   |   (yes/no)          |                    |
+   +---------------------+                    |
+            |                                  |
+       yes  |  no                              |
+            v                                  |
+   +---------------------+                    |
+   |  Follow Path        |                    |
+   |  (move along path)  |                    |
+   +---------------------+                    |
+            |                                  |
+            |                                  |
+            +------------+---------------------+
+                         |
+                         v
+             +---------------------+
+             |   AGENT MOVES       |
+             |   new position      |
+             +---------------------+
+                         |
+                         |
+                         +------> back to ENVIRONMENT (new observations)
+```
+
+---
+
+## Explanation of Each Block
+
+### 1. Observation Layers
+- The agent receives **noisy observations** at three scales:
+  - **Layer 0** (innermost, radius 2, low noise σ²=0.05) – high precision.
+  - **Layer 1** (middle, radius 4, σ²=0.10) – moderate.
+  - **Layer 2** (outermost, radius 8, σ²=0.20) – noisy but broad.
+- Observations are Gaussian samples clipped to [0,1], representing the probability that a cell is free.
+
+### 2. Belief Maps
+- Each layer maintains a **belief map** `b^(k)` – the probability that each cell is free.
+- Initially all set to 0.5 (complete ignorance).
+
+### 3. Upward Pass (Fine → Coarse)
+- Information propagates from the most precise layer (0) outward.
+- **Layer 0**: posterior = weighted average of prior and observation.
+- **Layer i > 0**: prior is taken from the posterior of layer i‑1.
+- This ensures that even the coarsest layer is informed by fine details.
+
+### 4. Downward Pass (Coarse → Fine)
+- Information flows back from the outermost layer inward.
+- Each layer is refined by mixing with the layer above (α = 0.3).
+- Global structure disambiguates local uncertainties.
+
+### 5. Fused Belief Map
+- After one full upward+downward cycle, the innermost layer becomes the **fused map**.
+- This is the agent’s best estimate, combining local detail and global context.
+
+### 6. Path Planning (A*)
+- The fused map is thresholded (τ = 0.45) to produce an obstacle map.
+- A* searches for the shortest path from agent to goal using Manhattan heuristic.
+- If a path exists, the agent follows it step‑by‑step, re‑planning after each move.
+
+### 7. Uncertainty‑Driven Exploration
+- If A* fails (no path), the agent switches to exploration.
+- **Uncertainty** `u(x,y) = b_fused * (1 - b_fused)` is maximised when belief is 0.5.
+- The agent moves to the adjacent free cell with highest uncertainty, preferring unvisited cells.
+- A small random tie‑breaker `ε` prevents deterministic loops.
+
+### 8. Movement & Cycle
+- After moving, the agent’s position changes.
+- New observations are taken, and the cycle repeats.
+- This closed‑loop process continues until the goal is reached.
+
+---
+
+## Information Flow Summary
+
+| Direction      | Meaning |
+|----------------|---------|
+| **Upward**     | Detailed local observations → coarse global beliefs (informs outer layers) |
+| **Downward**   | Global structure → refines local beliefs (resolves ambiguity) |
+| **Planning**   | Uses fused map to guide movement toward goal |
+| **Exploration**| When stuck, maximises information gain by visiting uncertain cells |
+
+---
+
+## Key Equations in the Diagram
+
+- **Observation**:  
+  \( z^{(k)}_{x,y} \sim \mathcal{N}(o(x,y), \sigma_k^2) \)
+
+- **Upward Pass (Layer 0)**:  
+  \( b^{(0)}_{\text{post}} = \frac{\alpha_0 \tilde{z}^{(0)} + \beta_0 b^{(0)}_{\text{prior}}}{\alpha_0 + \beta_0} \)
+
+- **Upward Pass (Layer i > 0)**:  
+  \( b^{(i)}_{\text{post}} = \frac{\alpha_i \tilde{z}^{(i)} + \beta_i b^{(i-1)}_{\text{post}}}{\alpha_i + \beta_i} \)
+
+- **Downward Pass**:  
+  \( b^{(i)}_{\text{refined}} = \alpha \, b^{(i+1)}_{\text{post}} + (1-\alpha) \, b^{(i)}_{\text{post}} \)
+
+- **Uncertainty**:  
+  \( u(x,y) = b_{\text{fused}}(x,y) \cdot (1 - b_{\text{fused}}(x,y)) \)
+
+- **Exploration Selection**:  
+  \( \mathbf{p}_{\text{next}} = \arg\max_{\mathbf{n} \in \mathcal{N}} \bigl( u(\mathbf{n}) + \epsilon \bigr) \)
+
+This diagram and explanation capture the complete hierarchical Bayesian inference system described in the document.
