@@ -22,10 +22,11 @@ except ImportError:
 # ──────────────────────────────────────────────────────────────
 # CONSTANTS
 # ──────────────────────────────────────────────────────────────
-MAZE_N      = 11          # 3-D grid side (must be odd)
+MAZE_N      = 11          # 3-D grid side default (must be odd)
 FRAME_W     = 700
 FRAME_H     = 560
 PORT        = 8750
+STRESS_MODE = False       # when True: no sleeps, max threads, CPU pegged
 
 # Isometric projection constants
 ISO_TILE_W  = 36          # width of one iso cell (pixels)
@@ -324,6 +325,22 @@ def _draw_sphere_t(draw, gx, gy, gz, ox, oy, tw, th, wh, color, r=7):
     draw.ellipse([cx-r, cy-r//2, cx+r, cy+r//2], fill=color[:3], outline='white')
 
 
+def _scaled_tiles(n, zoom=False):
+    """Return (tw, th, wh) scaled so the full cube always fits the target footprint."""
+    # Base tile sizes are calibrated for n=11.
+    # Scale inversely with n so the rendered cube stays the same screen size.
+    base_tw, base_th, base_wh = ISO_TILE_W, ISO_TILE_H, ISO_WALL_H
+    if zoom:
+        base_tw, base_th, base_wh = 64, 32, 40
+    scale = 11 / max(n, 1)
+    tw = max(4, int(base_tw * scale))
+    th = max(2, int(base_th * scale))
+    wh = max(2, int(base_wh * scale))
+    # keep th even so diamond tiles are symmetric
+    if th % 2 != 0: th += 1
+    return tw, th, wh
+
+
 def render_frame(maze, solver, current_path, show_layer=-1):
     img  = Image.new('RGB', (FRAME_W, FRAME_H), '#05100a')
     draw = ImageDraw.Draw(img, 'RGBA')
@@ -332,13 +349,8 @@ def render_frame(maze, solver, current_path, show_layer=-1):
     fm = solver.fused()
 
     zoom_mode = show_layer != -1
-    if zoom_mode:
-        # Zoom: bigger tiles, draw only the selected layer
-        tw, th, wh = 64, 32, 40
-        sphere_r = 13
-    else:
-        tw, th, wh = ISO_TILE_W, ISO_TILE_H, ISO_WALL_H
-        sphere_r = 8
+    tw, th, wh = _scaled_tiles(n, zoom=zoom_mode)
+    sphere_r = max(3, int(8 * (11 / max(n, 1)))) if not zoom_mode else max(5, int(13 * (11 / max(n, 1))))
 
     ox, oy = _auto_origin_t(n, FRAME_W, FRAME_H, tw, th, wh, margin=28)
 
@@ -367,7 +379,7 @@ def render_frame(maze, solver, current_path, show_layer=-1):
                                  '#0d1f14', '#081208', '#0a1a0f', outline='#0f2a14')
                     if (x,y,z) in path_set:
                         sx, sy = _iso_project_t(x, y, z, ox, oy, tw, th, wh)
-                        pr = max(3, tw // 10)
+                        pr = max(2, tw // 8)
                         cx, cy = sx, sy + th//2
                         draw.ellipse([cx-pr, cy-pr//2, cx+pr, cy+pr//2], fill='white')
 
@@ -417,13 +429,22 @@ show_layer   = -1
 recording    = False
 gif_frames   = []
 last_frame   = None      # cached PIL Image
+maze_n       = MAZE_N    # mutable current size
+goal_reached_flag  = False   # latched until client ACKs
+goal_reached_steps = 0
 
-def _new_maze(nov=1.0, pen=2.0):
-    global maze, solver, current_path, steps, auto_running, recording, gif_frames
+def _new_maze(nov=1.0, pen=2.0, n=None):
+    global maze, solver, current_path, steps, auto_running, recording, gif_frames, maze_n
+    global _pred_pending, _acc_hits, _acc_total, goal_reached_flag, goal_reached_steps
+    _pred_pending = None; _acc_hits = 0; _acc_total = 0
+    goal_reached_flag = False; goal_reached_steps = 0
+    if n is not None:
+        n = max(5, n | 1)   # enforce odd, minimum 5
+        maze_n = n
     auto_running = False
     recording    = False
     gif_frames   = []
-    maze         = Maze3D(MAZE_N)
+    maze         = Maze3D(maze_n)
     maze.generate()
     solver       = HierarchicalPathfinder3D(maze, nov, pen)
     solver.belief_step()
@@ -438,12 +459,22 @@ def _get_frame():
     return img
 
 def _do_step(nov=None, pen=None):
-    global current_path, steps
+    global current_path, steps, _pred_pending, _acc_hits, _acc_total
+    global active_battle, battle_running
+    # Don't move while in battle
+    if battle_running or (active_battle and not active_battle.finished):
+        return False
     with lock:
         if nov is not None: solver.novelty_weight  = nov
         if pen is not None: solver.revisit_penalty = pen
+        if _pred_pending is not None:
+            deep_before = solver.deep_obs()
+            score = _record_outcome(_pred_pending, deep_before)
+            _acc_hits  += score
+            _acc_total += 1
         path = solver.plan_path()
         moved = False
+        prev_pos = tuple(solver.agent)
         if path and len(path)>=2:
             nxt = path[1]
             if solver.is_free_belief(*nxt):
@@ -457,20 +488,532 @@ def _do_step(nov=None, pen=None):
             solver.belief_step()
             current_path = []
             steps += 1
-        reached = tuple(solver.agent) == maze.goal
+        new_pos = tuple(solver.agent)
+        reached = new_pos == tuple(maze.goal)
+        if reached:
+            global goal_reached_flag, goal_reached_steps
+            goal_reached_flag  = True
+            goal_reached_steps = steps
+        deep_after = solver.deep_obs()
+        _pred_pending = _make_prediction(solver, current_path, deep_after)
+    # Encounter check on a new cell
+    if new_pos != prev_pos and not reached and battles_enabled:
+        if random.random() < ENCOUNTER_CHANCE:
+            _start_battle(new_pos)
     return reached
 
 def _auto_loop():
     global auto_running, gif_frames, recording
+    stall_limit = 400
+    step_count  = 0
     while auto_running:
+        # Wait out any active battle
+        if battle_running or (active_battle and not active_battle.finished):
+            if not STRESS_MODE:
+                time.sleep(0.1)
+            continue
+        # Clean up finished battle
+        if active_battle and active_battle.finished:
+            _end_battle()
         done = _do_step()
         if recording:
             img = _get_frame()
             gif_frames.append(img.copy())
         if done:
+            if STRESS_MODE:
+                # In stress mode keep going: regenerate and loop forever
+                _new_maze(nov=solver.novelty_weight if solver else 1.0,
+                          pen=solver.revisit_penalty if solver else 2.0)
+                step_count = 0
+                continue
             auto_running = False
             break
-        time.sleep(0.08)
+        step_count += 1
+        if step_count >= stall_limit:
+            _new_maze(nov=solver.novelty_weight if solver else 1.0,
+                      pen=solver.revisit_penalty if solver else 2.0)
+            step_count = 0
+        if not STRESS_MODE:
+            time.sleep(0.08)
+
+# ──────────────────────────────────────────────────────────────
+# DUNGEON BATTLE ENGINE
+# ──────────────────────────────────────────────────────────────
+ENCOUNTER_CHANCE = 0.20   # probability per new corridor cell entered
+MOB_NAMES = ['Shade','Wraith','Golem','Specter','Crawler','Lurker','Revenant']
+
+# ── Player XP / level ─────────────────────────────────────────
+# XP needed to reach level N = 100 * N^1.5  (cumulative from 0)
+player_xp    = 0
+player_level = 1
+
+def _xp_for_level(lvl):
+    """Total XP required to reach this level."""
+    return int(100 * (lvl ** 1.5))
+
+def _add_xp(amount):
+    global player_xp, player_level
+    player_xp += amount
+    while player_xp >= _xp_for_level(player_level + 1):
+        player_level += 1
+
+def _level_hit_bonus(agent_conf, mob_conf):
+    """
+    Extra hit-chance bonus from player level when agent confidence
+    exceeds mob confidence.  Scales with level and confidence gap.
+    At level 1 contributes nothing; grows to +0.30 at level 20.
+    """
+    conf_edge = max(0.0, agent_conf - mob_conf)   # only when ahead
+    level_scale = min(1.0, (player_level - 1) / 19.0)  # 0→1 over levels 1-20
+    return conf_edge * level_scale * 0.40
+
+def _level_damage_bonus():
+    """Flat bonus damage per hit scaling with level."""
+    return (player_level - 1) * 2   # +2 dmg per level above 1
+
+def _xp_reward(mob_max_hp):
+    """XP awarded for killing a mob, proportional to its strength."""
+    return int(20 + mob_max_hp * 0.5 + player_level * 3)
+
+class Combatant:
+    """A fighter in the battle arena (agent or mob)."""
+    def __init__(self, name, hp, color):
+        self.name   = name
+        self.hp     = hp
+        self.max_hp = hp
+        self.color  = color          # (R,G,B)
+        # arena position in [0,1]² normalised coords
+        self.ax = 0.5
+        self.ay = 0.5
+        # velocity for smooth animation
+        self.vx = 0.0
+        self.vy = 0.0
+        # current strike direction (degrees: 0=right 90=up 180=left 270=down)
+        self.strike_dir  = None
+        # dodge direction chosen this tick
+        self.dodge_dir   = None
+        # visual flash state
+        self.hit_flash   = 0    # ticks remaining
+        self.miss_flash  = 0
+        # prediction confidence this tick
+        self.pred_conf   = 0.5
+
+    def apply_move(self, dx, dy, speed=0.06):
+        self.ax = max(0.08, min(0.92, self.ax + dx * speed))
+        self.ay = max(0.08, min(0.92, self.ay + dy * speed))
+
+    def hp_frac(self):
+        return max(0.0, self.hp / self.max_hp)
+
+
+def _battle_predict(attacker, defender, belief_val, momentum, curvature):
+    """
+    Use light.html math to pick strike direction and confidence.
+    Returns (angle_deg, confidence 0-1, dodge_angle_deg).
+    """
+    # γ from attacker hp uncertainty
+    hp_unc = 1.0 - attacker.hp_frac()
+    v_c = min(0.99, hp_unc * 1.5)
+    gamma = 1.0 / math.sqrt(max(1e-9, 1.0 - v_c**2))
+
+    # Ψ₀ proxy: spatial belief gradient
+    psi0 = abs(curvature) * gamma + abs(momentum) * 2.0
+
+    # Choose strike direction: toward defender, perturbed by Ψ₀
+    dx = defender.ax - attacker.ax
+    dy = defender.ay - attacker.ay
+    raw_angle = math.degrees(math.atan2(-dy, dx)) % 360
+    # Snap to nearest 90°
+    snapped = round(raw_angle / 90) * 90 % 360
+
+    # Confidence: Q_n proxy
+    dist = math.hypot(dx, dy)
+    proximity = max(0.0, 1.0 - dist / 1.4)
+    conf = min(0.95, 0.5 + 0.3 * proximity + 0.2 * belief_val)
+
+    # Defender dodge: use curvature to predict strike and sidestep
+    dodge_perturb = 90 if curvature >= 0 else -90
+    dodge_angle = (snapped + dodge_perturb) % 360
+
+    return snapped, conf, dodge_angle
+
+
+def _resolve_hit(strike_angle, dodge_angle, attacker_conf, defender_conf,
+                 is_agent_attacking=False):
+    """
+    Returns (hit: bool, damage: int).
+    Base 50% hit. Dodge works if within 45° of strike direction.
+    When is_agent_attacking, applies level-based confidence bonus.
+    """
+    angle_diff = abs((strike_angle - dodge_angle + 180) % 360 - 180)
+    dodge_works = angle_diff <= 45
+
+    hit_chance = 0.50 + 0.30 * attacker_conf - 0.20 * defender_conf
+    if dodge_works:
+        hit_chance -= 0.35
+
+    if is_agent_attacking:
+        hit_chance += _level_hit_bonus(attacker_conf, defender_conf)
+
+    hit = random.random() < max(0.05, min(0.95, hit_chance))
+    if hit:
+        base_dmg = random.randint(5, 15)
+        damage = base_dmg + (_level_damage_bonus() if is_agent_attacking else 0)
+    else:
+        damage = 0
+    return hit, damage
+
+
+class BattleArena:
+    """Manages a single dungeon battle."""
+    ARENA_W = FRAME_W
+    ARENA_H = FRAME_H
+
+    def __init__(self, cell_xyz, maze_ref, solver_ref):
+        self.cell   = cell_xyz
+        self.maze   = maze_ref
+        self.solver = solver_ref
+        self.agent  = Combatant('Agent', 100, (255, 220, 50))
+        self.mob    = Combatant(random.choice(MOB_NAMES), random.randint(60,120), (180, 50, 255))
+        # place them on opposite sides
+        self.agent.ax, self.agent.ay = 0.25, 0.5
+        self.mob.ax,   self.mob.ay   = 0.75, 0.5
+        self.tick      = 0
+        self.log       = []           # last few event strings
+        self.finished  = False
+        self.winner    = None         # 'agent' or 'mob'
+        self._tick_lock = threading.Lock()
+
+    def _add_log(self, msg):
+        self.log.append(msg)
+        if len(self.log) > 6: self.log.pop(0)
+
+    def step(self):
+        """Advance one battle tick."""
+        with self._tick_lock:
+            if self.finished: return
+            self.tick += 1
+
+            # Gather observation values from solver
+            fm  = self.solver.fused()
+            ax2, ay2, az2 = self.solver.agent
+            n   = self.solver.n
+            cv  = float(fm[ax2, ay2, az2]) if (0<=ax2<n and 0<=ay2<n and 0<=az2<n) else 0.5
+            nbv = []
+            for dx,dy,dz in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]:
+                nx2,ny2,nz2=ax2+dx,ay2+dy,az2+dz
+                if 0<=nx2<n and 0<=ny2<n and 0<=nz2<n:
+                    nbv.append(float(fm[nx2,ny2,nz2]))
+            kappa = sum(v-cv for v in nbv)/max(len(nbv),1)
+            ih = self.solver.info_history
+            M_O = (ih[-1]-ih[-2]) if len(ih)>=2 else 0.0
+
+            # -- Agent predicts strike
+            s_ang, a_conf, a_dodge = _battle_predict(
+                self.agent, self.mob, cv, M_O, kappa)
+            # -- Mob predicts strike (uses inverted curvature for variety)
+            m_ang, m_conf, m_dodge = _battle_predict(
+                self.mob, self.agent, 1.0-cv, -M_O, -kappa)
+
+            self.agent.strike_dir  = s_ang
+            self.agent.dodge_dir   = a_dodge
+            self.mob.strike_dir    = m_ang
+            self.mob.dodge_dir     = m_dodge
+            self.agent.pred_conf   = a_conf
+            self.mob.pred_conf     = m_conf
+
+            # -- Resolve agent→mob  (level bonuses apply)
+            hit_a, dmg_a = _resolve_hit(s_ang, m_dodge, a_conf, m_conf,
+                                        is_agent_attacking=True)
+            # -- Resolve mob→agent
+            hit_m, dmg_m = _resolve_hit(m_ang, a_dodge, m_conf, a_conf,
+                                        is_agent_attacking=False)
+
+            if hit_a:
+                self.mob.hp -= dmg_a
+                self.mob.hit_flash = 4
+                bonus = _level_damage_bonus()
+                bonus_str = f' (+{bonus} lvl)' if bonus > 0 else ''
+                self._add_log(f'Lv{player_level} Agent hits {self.mob.name} for {dmg_a}{bonus_str}')
+            else:
+                self.mob.miss_flash = 3
+                self._add_log(f'{self.mob.name} dodges agent strike')
+
+            if hit_m:
+                self.agent.hp -= dmg_m
+                self.agent.hit_flash = 4
+                self._add_log(f'{self.mob.name} hits Agent for {dmg_m}')
+            else:
+                self.agent.miss_flash = 3
+                self._add_log(f'Agent dodges {self.mob.name} strike')
+
+            # -- Movement / dancing
+            # Each fighter moves toward strike line, then dodges
+            s_rad = math.radians(s_ang)
+            m_rad = math.radians(m_ang)
+            d_rad_a = math.radians(a_dodge)
+            d_rad_m = math.radians(m_dodge)
+
+            # lunge toward opponent on strike, then pull back
+            lunge = 0.04 if self.tick % 4 < 2 else -0.02
+            self.agent.apply_move(math.cos(s_rad)*lunge + math.cos(d_rad_a)*0.02,
+                                  -math.sin(s_rad)*lunge - math.sin(d_rad_a)*0.02,
+                                  speed=1.0)
+            self.mob.apply_move(math.cos(m_rad)*lunge + math.cos(d_rad_m)*0.02,
+                                -math.sin(m_rad)*lunge - math.sin(d_rad_m)*0.02,
+                                speed=1.0)
+
+            # keep them separated (minimum 0.15)
+            dist = math.hypot(self.mob.ax-self.agent.ax, self.mob.ay-self.agent.ay)
+            if dist < 0.15:
+                push = 0.08
+                ang  = math.atan2(self.mob.ay-self.agent.ay, self.mob.ax-self.agent.ax)
+                self.mob.ax   += math.cos(ang)*push
+                self.mob.ay   += math.sin(ang)*push
+                self.agent.ax -= math.cos(ang)*push
+                self.agent.ay -= math.sin(ang)*push
+
+            # decrement flash
+            for c in (self.agent, self.mob):
+                if c.hit_flash  > 0: c.hit_flash  -= 1
+                if c.miss_flash > 0: c.miss_flash -= 1
+
+            # -- Check end
+            if self.mob.hp <= 0:
+                self.finished = True; self.winner = 'agent'
+                xp = _xp_reward(self.mob.max_hp)
+                old_level = player_level
+                _add_xp(xp)
+                lvl_str = f' — LEVEL UP to {player_level}!' if player_level > old_level else ''
+                self._add_log(f'Agent slays {self.mob.name}! +{xp} XP{lvl_str}')
+            elif self.agent.hp <= 0:
+                self.finished = True; self.winner = 'mob'
+                self._add_log(f'{self.mob.name} defeats Agent! Respawning…')
+
+    def to_dict(self):
+        xp_this  = player_xp
+        xp_next  = _xp_for_level(player_level + 1)
+        xp_prev  = _xp_for_level(player_level)
+        xp_frac  = (xp_this - xp_prev) / max(1, xp_next - xp_prev)
+        return {
+            'tick':     self.tick,
+            'finished': self.finished,
+            'winner':   self.winner,
+            'cell':     list(self.cell),
+            'log':      list(self.log),
+            'player_level': player_level,
+            'player_xp':    player_xp,
+            'xp_next':      xp_next,
+            'xp_frac':      round(xp_frac, 4),
+            'agent': {
+                'name':    self.agent.name,
+                'hp':      self.agent.hp,
+                'max_hp':  self.agent.max_hp,
+                'ax':      round(self.agent.ax,4),
+                'ay':      round(self.agent.ay,4),
+                'strike':  self.agent.strike_dir,
+                'dodge':   self.agent.dodge_dir,
+                'conf':    round(self.agent.pred_conf,3),
+                'hit_flash': self.agent.hit_flash,
+                'miss_flash':self.agent.miss_flash,
+            },
+            'mob': {
+                'name':    self.mob.name,
+                'hp':      self.mob.hp,
+                'max_hp':  self.mob.max_hp,
+                'ax':      round(self.mob.ax,4),
+                'ay':      round(self.mob.ay,4),
+                'strike':  self.mob.strike_dir,
+                'dodge':   self.mob.dodge_dir,
+                'conf':    round(self.mob.pred_conf,3),
+                'hit_flash': self.mob.hit_flash,
+                'miss_flash':self.mob.miss_flash,
+            },
+        }
+
+
+# active battle (None when not in combat)
+active_battle      = None
+battle_thread      = None
+battle_running     = False
+
+def _battle_loop():
+    global battle_running, active_battle, auto_running
+    while battle_running and active_battle and not active_battle.finished:
+        active_battle.step()
+        time.sleep(0.18)   # ~5 ticks/sec for readable animation
+    battle_running = False
+
+def _start_battle(cell_xyz):
+    global active_battle, battle_thread, battle_running
+    active_battle  = BattleArena(cell_xyz, maze, solver)
+    # Agent HP scales with level; mob gets a level-proportional difficulty bump
+    agent_max_hp = 100 + (player_level - 1) * 10
+    active_battle.agent.hp     = agent_max_hp
+    active_battle.agent.max_hp = agent_max_hp
+    mob_scale = 1.0 + (player_level - 1) * 0.08
+    active_battle.mob.hp     = int(active_battle.mob.hp * mob_scale)
+    active_battle.mob.max_hp = active_battle.mob.hp
+    battle_running = True
+    battle_thread  = threading.Thread(target=_battle_loop, daemon=True)
+    battle_thread.start()
+
+def _end_battle():
+    global active_battle, battle_running
+    battle_running = False
+    active_battle  = None
+
+
+# ──────────────────────────────────────────────────────────────
+# LIGHT.HTML PREDICTION ENGINE
+# Implements the Unified Relativistic Optical-Acoustic framework:
+#   Ψ₀  — spectral wave state of the observation field
+#   κ_I — information curvature (Laplacian of belief @ agent)
+#   M_O — observation momentum  (dI/dt)
+#   A_O — observation acceleration (d²I/dt²)
+#   H_O — Shannon entropy of belief map
+#   Q_n — recursive self-validation score
+#   R_causal — causal gating (reject if exceeds syndication limit)
+#   D_act — decision activation threshold
+# The engine uses these to forecast: next agent position, path
+# length change, and belief gain over the next step.
+# ──────────────────────────────────────────────────────────────
+_pred_history = []   # rolling list of {prediction, outcome} dicts
+
+def _make_prediction(slv, path, deep):
+    """
+    Given current solver state + deep_obs dict, emit a prediction
+    for the next step using light.html math.
+    Returns a dict ready to JSON-serialise.
+    """
+    ax, ay, az = slv.agent
+    n = slv.n
+    fm = slv.fused()
+
+    # ── Ψ₀: spectral amplitude proxy
+    # Model the belief map as a 1-D spectral signal; dominant
+    # "frequency" is the mean gradient magnitude (spatial variation).
+    grad = float(np.mean(np.abs(np.diff(fm.flatten()))))
+    psi0 = grad   # A(ω) proxy — higher → more structure ahead
+
+    # ── κ_I: information curvature at agent (discrete Laplacian)
+    cv = float(fm[ax, ay, az])
+    nbv = []
+    for dx,dy,dz in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]:
+        nx,ny,nz = ax+dx, ay+dy, az+dz
+        if 0<=nx<n and 0<=ny<n and 0<=nz<n:
+            nbv.append(float(fm[nx,ny,nz]))
+    kappa = sum(v - cv for v in nbv) / max(len(nbv), 1)
+
+    # ── M_O, A_O from deep_obs history
+    M_O = deep.get('M_O', 0.0)
+    A_O = deep.get('A_O', 0.0)
+    H_O = deep.get('H_O', 0.5)
+    Q_n = deep.get('Q_n', 0.0)
+    Pc  = deep.get('overall_certainty', 0.5)
+
+    # ── Shapiro-delay proxy: time-dilation factor γ
+    # γ = 1 / sqrt(1 - v²/c²).  Here v/c = uncertainty fraction.
+    unc = deep.get('agent_unc', 0.25)
+    v_over_c = min(0.999, unc * 2.0)
+    gamma = 1.0 / math.sqrt(1.0 - v_over_c**2)
+
+    # ── Causal gate R_causal
+    # Syndication speed c_synch proportional to global consensus.
+    c_synch = max(0.1, deep.get('global_consensus', 0.5))
+    d_step  = 1.0   # one Manhattan step
+    t_prop  = d_step / c_synch
+    R_causal = 1 if t_prop <= 1.5 else 0   # reject hyper-fast claims
+
+    # ── Decision activation D_act(P_c)
+    THETA_HIGH, THETA_LOW = 0.65, 0.35
+    if Pc > THETA_HIGH:
+        d_act = 'ALERT'
+    elif Pc >= THETA_LOW:
+        d_act = 'ARCHIVE'
+    else:
+        d_act = 'IDLE'
+
+    # ── Predict next agent position
+    # Score each free neighbour using momentum + curvature + γ
+    goal = slv.maze.goal
+    best_nb, best_score = None, -1e9
+    for dx,dy,dz in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]:
+        nx,ny,nz = ax+dx, ay+dy, az+dz
+        if not (0<=nx<n and 0<=ny<n and 0<=nz<n): continue
+        if float(fm[nx,ny,nz]) < 0.45: continue
+        h = abs(nx-goal[0])+abs(ny-goal[1])+abs(nz-goal[2])
+        vc = int(slv.visit_counts[nx,ny,nz])
+        # light.html cost: combine γ-weighted belief gradient with A* heuristic
+        score = (gamma * float(fm[nx,ny,nz])
+                 + M_O * 10
+                 + kappa
+                 - 0.1 * h
+                 - 0.3 * vc)
+        if score > best_score:
+            best_score, best_nb = score, (nx,ny,nz)
+
+    # ── Predict belief gain
+    pred_belief_gain = max(0.0, min(0.5, psi0 * gamma * (1 - H_O)))
+
+    # ── Predict path-length change
+    cur_plen = len(path)
+    pred_plen_delta = int(round(-1 * Pc * gamma))   # certainty → shorter path
+
+    # ── Noise floor N_floor
+    signal_var = float(np.var(fm))
+    noise_var  = max(1e-9, H_O * 0.25)
+    N_floor    = noise_var / max(signal_var, 1e-9)
+
+    # ── Escape effects E_escape (belief boundary leakage proxy)
+    border_belief = float(np.mean([
+        fm[0,:,:].mean(), fm[-1,:,:].mean(),
+        fm[:,0,:].mean(), fm[:,-1,:].mean(),
+        fm[:,:,0].mean(), fm[:,:,-1].mean(),
+    ]))
+    E_escape = abs(cv - border_belief)
+
+    return {
+        'pred_pos':          list(best_nb) if best_nb else [ax,ay,az],
+        'pred_belief_gain':  round(pred_belief_gain, 4),
+        'pred_plen_delta':   pred_plen_delta,
+        'gamma':             round(gamma, 4),
+        'psi0':              round(psi0, 5),
+        'kappa':             round(kappa, 5),
+        'R_causal':          R_causal,
+        'N_floor':           round(N_floor, 5),
+        'E_escape':          round(E_escape, 5),
+        'd_act':             d_act,
+        'Pc':                round(Pc, 4),
+        'Q_n':               round(Q_n, 5),
+    }
+
+
+def _record_outcome(pred, deep_after):
+    """Compare a prediction against what actually happened."""
+    hits = 0; total = 3
+    # 1. Did belief gain (direction correct)?
+    actual_gain = deep_after.get('I_now', 0) - (deep_after.get('I_now', 0) - deep_after.get('M_O', 0))
+    if (pred['pred_belief_gain'] > 0) == (actual_gain >= 0): hits += 1
+    # 2. D_act threshold match
+    pc_after = deep_after.get('overall_certainty', 0.5)
+    THETA_HIGH, THETA_LOW = 0.65, 0.35
+    if pc_after > THETA_HIGH:   d_act_actual = 'ALERT'
+    elif pc_after >= THETA_LOW: d_act_actual = 'ARCHIVE'
+    else:                       d_act_actual = 'IDLE'
+    if pred['d_act'] == d_act_actual: hits += 1
+    # 3. Path length direction (shorter/same/longer)
+    plen_after = deep_after.get('visited_count', 0)
+    if pred['pred_plen_delta'] < 0 and deep_after.get('M_O', 0) > 0: hits += 1
+    elif pred['pred_plen_delta'] >= 0 and deep_after.get('M_O', 0) <= 0: hits += 1
+    return hits / total
+
+
+# rolling accuracy state
+_pred_pending  = None   # last prediction dict awaiting outcome
+_acc_hits      = 0
+_acc_total     = 0
+
 
 # ──────────────────────────────────────────────────────────────
 # FLASK APP
@@ -489,7 +1032,8 @@ def mjpeg_generator():
         frame_bytes = buf.getvalue()
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
                + frame_bytes + b'\r\n')
-        time.sleep(1/24)  # ~24 fps
+        if not STRESS_MODE:
+            time.sleep(1/24)  # ~24 fps cap in normal mode
 
 @app.route('/stream')
 def stream():
@@ -500,9 +1044,11 @@ def stream():
 @app.route('/api/reset', methods=['POST'])
 def api_reset():
     d = request.get_json(silent=True) or {}
-    _new_maze(float(d.get('novelty',1.0)), float(d.get('penalty',2.0)))
+    raw_n = d.get('n', None)
+    n = int(raw_n) if raw_n is not None else None
+    _new_maze(float(d.get('novelty',1.0)), float(d.get('penalty',2.0)), n=n)
     _get_frame()
-    return jsonify({'ok': True})
+    return jsonify({'ok': True, 'n': maze_n})
 
 @app.route('/api/step', methods=['POST'])
 def api_step():
@@ -510,7 +1056,11 @@ def api_step():
     reached = _do_step(float(d.get('novelty',1.0)), float(d.get('penalty',2.0)))
     with lock:
         deep = solver.deep_obs()
-    return jsonify({'reached': reached, 'deep': deep,
+        pred = _pred_pending
+    acc = round(_acc_hits / _acc_total * 100, 1) if _acc_total else None
+    return jsonify({'reached': reached, 'deep': deep, 'pred': pred,
+                    'accuracy': acc,
+                    'acc_hits': _acc_hits, 'acc_total': _acc_total,
                     'path_len': len(current_path), 'steps': steps})
 
 @app.route('/api/auto/start', methods=['POST'])
@@ -574,6 +1124,16 @@ def api_record_stop():
     b64 = base64.b64encode(buf.getvalue()).decode()
     return jsonify({'ok': True, 'gif_b64': b64, 'frames': len(gif_frames)})
 
+@app.route('/api/predict', methods=['GET'])
+def api_predict():
+    if maze is None: return jsonify({})
+    with lock:
+        deep = solver.deep_obs()
+        pred = _make_prediction(solver, current_path, deep)
+    acc = round(_acc_hits / _acc_total * 100, 1) if _acc_total else None
+    return jsonify({'pred': pred, 'accuracy': acc,
+                    'acc_hits': _acc_hits, 'acc_total': _acc_total})
+
 @app.route('/api/deep', methods=['GET'])
 def api_deep():
     if maze is None: return jsonify({})
@@ -591,7 +1151,143 @@ def api_status():
     return jsonify({'ready': True, 'agent': ag, 'goal': goal,
                     'steps': steps, 'auto': auto_running,
                     'recording': recording, 'reached': reached,
+                    'goal_event': goal_reached_flag,
+                    'goal_steps': goal_reached_steps,
                     'path_len': len(current_path)})
+
+# ──────────────────────────────────────────────────────────────
+# STRESS TEST WORKERS
+# Each worker runs its own independent maze+solver loop as fast
+# as possible, hammering the CPU with A*, belief updates, and
+# numpy ops on every thread.
+# ──────────────────────────────────────────────────────────────
+import os, multiprocessing
+_stress_workers   = []
+_stress_lock      = threading.Lock()
+_stress_stats     = {}   # worker_id → steps completed
+
+def _stress_worker(worker_id, n, stop_event):
+    """Fully independent maze solve loop — no sleeps, no shared state."""
+    local_maze   = Maze3D(n)
+    local_maze.generate()
+    local_solver = HierarchicalPathfinder3D(local_maze, 1.0, 2.0)
+    local_solver.belief_step()
+    steps = 0
+    stall = 0
+    while not stop_event.is_set():
+        path = local_solver.plan_path()
+        moved = False
+        if path and len(path) >= 2:
+            nxt = path[1]
+            if local_solver.is_free_belief(*nxt):
+                local_solver.move_agent(nxt)
+                local_solver.belief_step()
+                steps += 1
+                moved = True
+                stall = 0
+        if not moved:
+            local_solver.explore()
+            local_solver.belief_step()
+            steps += 1
+            stall += 1
+        if tuple(local_solver.agent) == local_maze.goal or stall > 300:
+            # regenerate and keep hammering
+            local_maze.generate()
+            local_solver = HierarchicalPathfinder3D(local_maze, 1.0, 2.0)
+            local_solver.belief_step()
+            stall = 0
+        _stress_stats[worker_id] = steps
+
+_stress_stop_events = {}
+
+def _launch_stress_workers(n_workers, maze_n_val):
+    global _stress_workers, _stress_stats, _stress_stop_events
+    _stop_stress_workers()
+    _stress_stats = {}
+    for wid in range(n_workers):
+        ev = threading.Event()
+        _stress_stop_events[wid] = ev
+        t = threading.Thread(target=_stress_worker,
+                             args=(wid, maze_n_val, ev), daemon=True)
+        _stress_workers.append(t)
+        t.start()
+
+def _stop_stress_workers():
+    global _stress_workers, _stress_stop_events
+    for ev in _stress_stop_events.values():
+        ev.set()
+    _stress_workers = []
+    _stress_stop_events = {}
+    _stress_stats.clear()
+
+# ── Stress test endpoint ──────────────────────────────────────
+@app.route('/api/stress', methods=['POST'])
+def api_stress():
+    global STRESS_MODE, auto_running, auto_thread
+    d = request.get_json(silent=True) or {}
+    enable = bool(d.get('enable', False))
+    n_workers = int(d.get('workers', os.cpu_count() or 4))
+    STRESS_MODE = enable
+    if enable:
+        _launch_stress_workers(n_workers, maze_n)
+        # also kick off the main auto loop at full speed
+        if not auto_running:
+            auto_running = True
+            auto_thread = threading.Thread(target=_auto_loop, daemon=True)
+            auto_thread.start()
+    else:
+        _stop_stress_workers()
+    return jsonify({'ok': True, 'stress': STRESS_MODE,
+                    'workers': len(_stress_workers)})
+
+@app.route('/api/stress/stats', methods=['GET'])
+def api_stress_stats():
+    total = sum(_stress_stats.values())
+    return jsonify({'stress': STRESS_MODE,
+                    'workers': len(_stress_workers),
+                    'worker_steps': dict(_stress_stats),
+                    'total_steps': total,
+                    'cpu_count': os.cpu_count()})
+
+# ── Battle toggle endpoint ────────────────────────────────────
+battles_enabled = True
+
+@app.route('/api/battles/toggle', methods=['POST'])
+def api_battles_toggle():
+    global battles_enabled
+    d = request.get_json(silent=True) or {}
+    battles_enabled = bool(d.get('enable', True))
+    # End any active battle immediately when disabling
+    if not battles_enabled and active_battle:
+        _end_battle()
+    return jsonify({'ok': True, 'battles_enabled': battles_enabled})
+
+# ── Battle endpoints ──────────────────────────────────────────
+@app.route('/api/battle', methods=['GET'])
+def api_battle():
+    xp_next = _xp_for_level(player_level + 1)
+    xp_prev = _xp_for_level(player_level)
+    xp_frac = (player_xp - xp_prev) / max(1, xp_next - xp_prev)
+    base = {'player_level': player_level, 'player_xp': player_xp,
+            'xp_next': xp_next, 'xp_frac': round(xp_frac, 4)}
+    if active_battle is None:
+        return jsonify({**base, 'active': False})
+    d = active_battle.to_dict()
+    d['active'] = True
+    return jsonify(d)
+
+@app.route('/api/battle/dismiss', methods=['POST'])
+def api_battle_dismiss():
+    """Manually dismiss a finished battle and resume."""
+    if active_battle and active_battle.finished:
+        _end_battle()
+    return jsonify({'ok': True})
+
+@app.route('/api/ack_goal', methods=['POST'])
+def api_ack_goal():
+    global goal_reached_flag
+    goal_reached_flag = False
+    return jsonify({'ok': True})
 
 # ── Main page ─────────────────────────────────────────────────
 @app.route('/')
@@ -628,6 +1324,32 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
 .sub{font-size:10px;color:var(--mut);font-family:var(--mono)}
 .badge{margin-left:auto;font-family:var(--mono);font-size:9px;color:var(--mut);
   border:1px solid var(--bdr);padding:3px 8px;border-radius:3px}
+/* maze size input */
+.size-wrap{display:flex;align-items:center;gap:6px;margin-left:10px}
+.size-wrap label{font-family:var(--mono);font-size:9px;color:var(--mut)}
+#maze-size-input{font-family:var(--mono);font-size:10px;width:44px;padding:3px 6px;
+  background:var(--bg);border:1px solid var(--bdr);color:var(--grn);border-radius:3px;
+  text-align:center}
+#maze-size-input:focus{outline:none;border-color:var(--grn)}
+.size-apply{font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid var(--gdim);
+  background:transparent;color:var(--grn);border-radius:3px;cursor:pointer}
+.size-apply:hover{background:rgba(0,255,136,.1)}
+/* prediction panel */
+#pred-panel{border-bottom:1px solid var(--bdr);padding:10px 13px}
+.acc-bar-wrap{display:flex;align-items:center;gap:7px;margin-bottom:6px}
+.acc-label{font-family:var(--mono);font-size:8px;color:var(--mut);white-space:nowrap}
+.acc-bar-outer{flex:1;height:8px;background:var(--bg);border:1px solid var(--bdr);border-radius:4px;overflow:hidden}
+.acc-bar-inner{height:100%;background:var(--grn);width:0%;transition:width .4s;border-radius:4px}
+.acc-pct{font-family:var(--mono);font-size:10px;color:var(--grn);font-weight:700;width:36px;text-align:right}
+.pred-row{font-family:var(--mono);font-size:9px;color:#8bbba0;line-height:1.8}
+.pred-row .pk{color:var(--mut)}
+.pred-row .pv{color:var(--grn);font-weight:700}
+.pred-row .pv-y{color:var(--yel);font-weight:700}
+.pred-row .pv-v{color:var(--vio);font-weight:700}
+.pred-row .pv-r{color:var(--red);font-weight:700}
+.d-act-ALERT{color:var(--red)!important}
+.d-act-ARCHIVE{color:var(--yel)!important}
+.d-act-IDLE{color:var(--mut)!important}
 
 /* ── VIEWER ── */
 #viewer{position:relative;overflow:hidden;background:#020704;display:flex;align-items:center;justify-content:center}
@@ -649,6 +1371,7 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
 
 /* ── PANEL ── */
 #panel{border-left:1px solid var(--bdr);background:var(--surf);display:flex;flex-direction:column;overflow:hidden}
+#panel-scroll{flex:1;overflow-y:auto;display:flex;flex-direction:column}
 .psec{border-bottom:1px solid var(--bdr);padding:11px 13px;flex-shrink:0}
 .plbl{font-family:var(--mono);font-size:8px;letter-spacing:.15em;color:var(--mut);
   text-transform:uppercase;margin-bottom:7px}
@@ -665,7 +1388,7 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
 #status{font-family:var(--mono);font-size:9px;color:var(--mut);margin-top:5px;min-height:13px}
 
 /* ── MATH PANEL ── */
-#math-wrap{flex:1;overflow-y:auto;padding:9px 12px 14px}
+#math-wrap{padding:9px 12px 14px}
 .tog-bar{display:flex;gap:3px;flex-wrap:wrap;margin-bottom:9px}
 .mtog{font-family:var(--mono);font-size:8px;padding:3px 6px;border:1px solid var(--bdr);
   background:transparent;color:var(--mut);border-radius:2px;cursor:pointer;transition:all .12s}
@@ -698,6 +1421,36 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
 /* gif download */
 #gif-link{display:none;font-family:var(--mono);font-size:9px;color:var(--grn);
   text-decoration:underline;cursor:pointer;margin-top:4px}
+
+/* ── XP / LEVEL HUD ── */
+#xp-hud{display:flex;align-items:center;gap:8px;padding:5px 13px;
+  border-bottom:1px solid var(--bdr);background:var(--surf)}
+#xp-level{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--yel);
+  white-space:nowrap;min-width:52px}
+#xp-bar-outer{flex:1;height:7px;background:var(--bg);border:1px solid var(--bdr);
+  border-radius:4px;overflow:hidden}
+#xp-bar-inner{height:100%;background:var(--yel);width:0%;transition:width .4s;border-radius:4px}
+#xp-label{font-family:var(--mono);font-size:8px;color:var(--mut);white-space:nowrap}
+#xp-bonus{font-family:var(--mono);font-size:8px;color:var(--grn);white-space:nowrap;min-width:80px;text-align:right}
+
+/* ── BATTLE OVERLAY ── */
+#battle-overlay{position:absolute;top:0;left:0;right:0;bottom:0;
+  background:#020c06ee;display:none;flex-direction:column;align-items:center;justify-content:center;
+  z-index:10}
+#battle-canvas{border:1px solid var(--bdr);border-radius:6px;background:#030d07;display:block}
+#battle-log{font-family:var(--mono);font-size:9px;color:#7acc9a;text-align:center;
+  margin-top:6px;height:80px;overflow:hidden;width:440px;line-height:1.6}
+#battle-title{font-family:var(--mono);font-size:11px;color:var(--grn);letter-spacing:.12em;
+  text-transform:uppercase;margin-bottom:8px}
+#battle-dismiss{margin-top:8px;font-family:var(--mono);font-size:9px;padding:5px 14px;
+  border:1px solid var(--gdim);background:transparent;color:var(--grn);
+  border-radius:3px;cursor:pointer;display:none}
+#battle-dismiss:hover{background:rgba(0,255,136,.1)}
+.hp-wrap{display:flex;align-items:center;gap:8px;width:440px;margin-bottom:4px}
+.hp-name{font-family:var(--mono);font-size:9px;width:60px;color:var(--mut)}
+.hp-bar-outer{flex:1;height:7px;background:#0a1a0e;border:1px solid var(--bdr);border-radius:3px;overflow:hidden}
+.hp-bar-inner{height:100%;border-radius:3px;transition:width .2s}
+.hp-val{font-family:var(--mono);font-size:9px;width:44px;text-align:right;color:var(--txt)}
 </style>
 </head>
 <body>
@@ -705,8 +1458,13 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
 
 <header>
   <h1>Deep Observation — 3D Cube Maze</h1>
-  <span class="sub">Hierarchical Bayesian · A* · 7-Module Math Suite</span>
-  <span class="badge">:8750 · MJPEG Live</span>
+  <span class="sub">Hierarchical Bayesian · A* · Optical-Acoustic Predictor</span>
+  <div class="size-wrap">
+    <label>SIZE</label>
+    <input id="maze-size-input" type="number" min="5" max="31" step="2" value="11" title="Maze side length (odd, 5–31)">
+    <button class="size-apply" onclick="applySize()">Apply</button>
+  </div>
+  <span class="badge" id="size-badge">11×11×11 · :8750</span>
 </header>
 
 <!-- ── VIEWER ── -->
@@ -716,6 +1474,25 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
     <div id="reached-banner">🎉 GOAL REACHED!<br><span style="font-size:13px" id="reached-steps"></span></div>
     <div id="rec-dot"></div>
   </div>
+
+  <!-- BATTLE OVERLAY -->
+  <div id="battle-overlay">
+    <div id="battle-title">⚔ DUNGEON ENCOUNTER</div>
+    <div class="hp-wrap">
+      <span class="hp-name" id="b-aname">Agent</span>
+      <div class="hp-bar-outer"><div class="hp-bar-inner" id="b-ahp" style="background:var(--yel);width:100%"></div></div>
+      <span class="hp-val" id="b-ahpv">100/100</span>
+    </div>
+    <div class="hp-wrap">
+      <span class="hp-name" id="b-mname">Mob</span>
+      <div class="hp-bar-outer"><div class="hp-bar-inner" id="b-mhp" style="background:var(--vio);width:100%"></div></div>
+      <span class="hp-val" id="b-mhpv">100/100</span>
+    </div>
+    <canvas id="battle-canvas" width="440" height="300"></canvas>
+    <div id="battle-log"></div>
+    <button id="battle-dismiss" onclick="dismissBattle()">Continue</button>
+  </div>
+
   <div id="layer-bar">
     <span>Z-LAYER</span>
     <button class="lbtn on" onclick="setLayer(-1)">ALL</button>
@@ -729,6 +1506,7 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
 
 <!-- ── PANEL ── -->
 <div id="panel">
+<div id="panel-scroll">
 
   <!-- Controls -->
   <div class="psec">
@@ -746,6 +1524,13 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
       <button class="btn" id="rbtn" onclick="toggleRecord()">⏺ Record GIF</button>
       <a id="gif-link" download="maze_solve.gif">⬇ Download GIF</a>
     </div>
+    <div class="brow">
+      <button class="btn" id="stress-btn" onclick="toggleStress()" style="border-color:#ff6600;color:#ff6600">⚡ Stress Test</button>
+      <button class="btn" id="battle-toggle-btn" onclick="toggleBattles()" style="border-color:var(--vio);color:var(--vio)">⚔ Battles ON</button>
+    </div>
+    <div class="brow">
+      <span style="font-family:var(--mono);font-size:8px;color:var(--mut)" id="stress-info">CPU stress off</span>
+    </div>
     <div class="srow"><label>Novelty η</label>
       <input type="range" id="nov" min="0" max="5" step="0.1" value="1.0" oninput="sv(this,'nv')">
       <span class="val" id="nv">1.0</span></div>
@@ -756,6 +1541,37 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
       <input type="range" id="poll" min="100" max="2000" step="50" value="300" oninput="sv(this,'pollv');restartPoll()">
       <span class="val" id="pollv">300</span><span class="dim" style="font-size:8px">ms</span></div>
     <div id="status">Loading…</div>
+  </div>
+
+  <!-- XP / Level HUD -->
+  <div id="xp-hud">
+    <span id="xp-level">LV 1</span>
+    <div id="xp-bar-outer"><div id="xp-bar-inner"></div></div>
+    <span id="xp-label">0 XP</span>
+    <span id="xp-bonus">hit +0%</span>
+  </div>
+
+  <!-- Prediction Panel -->
+  <div id="pred-panel">
+    <div class="plbl">Light-Math Prediction &amp; Accuracy</div>
+    <div class="acc-bar-wrap">
+      <span class="acc-label">ACCURACY</span>
+      <div class="acc-bar-outer"><div class="acc-bar-inner" id="acc-bar"></div></div>
+      <span class="acc-pct" id="acc-pct">—</span>
+      <span class="acc-label" id="acc-counts" style="font-size:8px"></span>
+    </div>
+    <div class="pred-row">
+      <span class="pk">Next pos </span><span class="pv" id="p-pos">—</span>
+      &nbsp;<span class="pk">γ </span><span class="pv" id="p-gamma">—</span><br>
+      <span class="pk">Ψ₀ </span><span class="pv" id="p-psi">—</span>
+      &nbsp;<span class="pk">κ </span><span class="pv" id="p-kappa">—</span><br>
+      <span class="pk">Δpath </span><span class="pv-y" id="p-dplen">—</span>
+      &nbsp;<span class="pk">Δbelief </span><span class="pv" id="p-dbel">—</span><br>
+      <span class="pk">N_floor </span><span class="pv" id="p-nfloor">—</span>
+      &nbsp;<span class="pk">E_esc </span><span class="pv" id="p-eesc">—</span><br>
+      <span class="pk">R_causal </span><span id="p-rcausal">—</span>
+      &nbsp;<span class="pk">D_act </span><span id="p-dact">—</span>
+    </div>
   </div>
 
   <!-- Legend -->
@@ -920,6 +1736,7 @@ header h1{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:
     </div>
 
   </div><!-- math-wrap -->
+</div><!-- panel-scroll -->
 </div><!-- panel -->
 </div><!-- app -->
 
@@ -951,6 +1768,54 @@ MODS.forEach(m => {
   togBar.appendChild(b);
 });
 
+// ── Maze size ─────────────────────────────────────────────
+async function applySize() {
+  let v = parseInt(document.getElementById('maze-size-input').value) || 11;
+  if (v < 5)  v = 5;
+  if (v > 31) v = 31;
+  if (v % 2 === 0) v += 1;   // force odd
+  document.getElementById('maze-size-input').value = v;
+  setStatus(`Generating ${v}×${v}×${v} maze…`);
+  document.getElementById('reached-banner').style.display='none';
+  const r = await post('/api/reset', {novelty:nov(), penalty:pen(), n:v});
+  document.getElementById('size-badge').textContent = `${r.n}×${r.n}×${r.n} · :8750`;
+  setStatus('Ready.');
+}
+
+// ── Prediction display ────────────────────────────────────
+function updatePred(pred, accuracy, hits, total) {
+  if (!pred) return;
+  function sp(id, v) { const e=document.getElementById(id); if(e) e.textContent=v??'—'; }
+  sp('p-pos',    pred.pred_pos ? `(${pred.pred_pos.join(',')})` : '—');
+  sp('p-gamma',  pred.gamma);
+  sp('p-psi',    pred.psi0);
+  sp('p-kappa',  pred.kappa);
+  sp('p-dplen',  pred.pred_plen_delta >= 0 ? `+${pred.pred_plen_delta}` : pred.pred_plen_delta);
+  sp('p-dbel',   `+${pred.pred_belief_gain}`);
+  sp('p-nfloor', pred.N_floor);
+  sp('p-eesc',   pred.E_escape);
+
+  const rc = document.getElementById('p-rcausal');
+  if (rc) { rc.textContent = pred.R_causal ? '✓ PASS' : '✗ REJECT';
+            rc.className = pred.R_causal ? 'pv' : 'pv-r'; }
+
+  const da = document.getElementById('p-dact');
+  if (da) { da.textContent = pred.d_act;
+            da.className = 'd-act-' + pred.d_act; }
+
+  // Accuracy ticker
+  if (accuracy !== null && accuracy !== undefined) {
+    const pct = parseFloat(accuracy);
+    document.getElementById('acc-pct').textContent = pct.toFixed(1) + '%';
+    document.getElementById('acc-bar').style.width = pct + '%';
+    document.getElementById('acc-bar').style.background =
+      pct >= 70 ? 'var(--grn)' : pct >= 45 ? 'var(--yel)' : 'var(--red)';
+  }
+  if (hits !== undefined && total !== undefined && total > 0) {
+    document.getElementById('acc-counts').textContent = `${Math.round(hits)}/${total}`;
+  }
+}
+
 // ── Slider helper ─────────────────────────────────────────
 function sv(el, id) { document.getElementById(id).textContent = parseFloat(el.value).toFixed(1); }
 function nov() { return parseFloat(document.getElementById('nov').value); }
@@ -968,7 +1833,12 @@ async function post(url, body={}) {
 async function doReset() {
   setStatus('Generating 3D maze…');
   document.getElementById('reached-banner').style.display='none';
-  await post('/api/reset', {novelty:nov(), penalty:pen()});
+  const r = await post('/api/reset', {novelty:nov(), penalty:pen()});
+  if (r.n) document.getElementById('size-badge').textContent = `${r.n}×${r.n}×${r.n} · :8750`;
+  // reset accuracy display
+  document.getElementById('acc-pct').textContent = '—';
+  document.getElementById('acc-bar').style.width = '0%';
+  document.getElementById('acc-counts').textContent = '';
   setStatus('Ready.');
 }
 async function doObserve() {
@@ -982,6 +1852,7 @@ async function doPlan() {
 async function doStep() {
   const d = await post('/api/step', {novelty:nov(), penalty:pen()});
   updateMath(d.deep);
+  updatePred(d.pred, d.accuracy, d.acc_hits, d.acc_total);
   if (d.reached) showReached(d.deep?.step);
   else setStatus(`Step ${d.steps} · path ${d.path_len} cells`);
 }
@@ -1043,9 +1914,13 @@ function showReached(steps) {
   const b = document.getElementById('reached-banner');
   document.getElementById('reached-steps').textContent = `${steps} steps`;
   b.style.display = 'block';
-  autoOn = false;
-  document.getElementById('abtn').textContent = '▶ Auto Solve';
   setStatus(`🎉 Goal reached in ${steps} steps!`);
+  // If auto-solving keep running; just flash the banner then hide it
+  if (!autoOn) {
+    document.getElementById('abtn').textContent = '▶ Auto Solve';
+  } else {
+    setTimeout(() => { b.style.display = 'none'; }, 2500);
+  }
 }
 
 // ── Status polling ────────────────────────────────────────
@@ -1140,8 +2015,11 @@ function updateMath(d) {
   set('d-ag', `(${d.step})`); // fallback — real agent pos comes from status
 }
 
-// get real agent pos from status poll
-const _origPoll = pollStatus;
+// get real agent pos from status poll + pull prediction
+const STALL_LIMIT = 60;  // steps without progress → auto-restart
+let   _lastSteps  = -1;
+let   _stallCount = 0;
+
 async function pollStatus2() {
   try {
     const s = await fetch('/api/status').then(r=>r.json());
@@ -1149,18 +2027,309 @@ async function pollStatus2() {
       set('d-ag',   `(${s.agent.join(',')})`);
       set('d-goal', `(${s.goal.join(',')})`);
       set('d-steps', s.steps);
-      if (s.reached) showReached(s.steps);
+      if (s.goal_event) {
+        showReached(s.goal_steps);
+        await fetch('/api/ack_goal', {method:'POST'});
+      }
       if (!s.auto && autoOn) {
         autoOn=false;
         document.getElementById('abtn').textContent='▶ Auto Solve';
       }
+      // stall detection — restart if stuck for STALL_LIMIT polls
+      // Don't count stalls during battle (steps freeze while fighting)
+      if (autoOn && !battleActive) {
+        if (s.steps === _lastSteps) {
+          _stallCount++;
+        } else {
+          _stallCount = 0; _lastSteps = s.steps;
+        }
+        if (_stallCount >= STALL_LIMIT) {
+          _stallCount = 0; _lastSteps = -1;
+          setStatus('Stall detected — restarting observation loop…');
+          await post('/api/auto/stop');
+          autoOn = false;
+          await post('/api/reset', {novelty:nov(), penalty:pen()});
+          await post('/api/auto/start', {novelty:nov(), penalty:pen()});
+          autoOn = true;
+          document.getElementById('abtn').textContent='⏹ Stop';
+          return;
+        }
+      }
     }
     const d = await fetch('/api/deep').then(r=>r.json());
     updateMath(d);
+    // pull fresh prediction every poll
+    const p = await fetch('/api/predict').then(r=>r.json());
+    updatePred(p.pred, p.accuracy, p.acc_hits, p.acc_total);
   } catch(e){}
 }
 clearInterval(pollTimer);
 pollTimer = setInterval(pollStatus2, parseInt(document.getElementById('poll').value));
+
+// ── Battle system ─────────────────────────────────────────
+let battleActive = false;
+let battlePollTimer = null;
+
+function startBattlePoll() {
+  if (battlePollTimer) clearInterval(battlePollTimer);
+  battlePollTimer = setInterval(pollBattle, 180);
+}
+function stopBattlePoll() {
+  if (battlePollTimer) clearInterval(battlePollTimer);
+  battlePollTimer = null;
+}
+
+async function pollBattle() {
+  try {
+    const b = await fetch('/api/battle').then(r=>r.json());
+    if (!b.active) {
+      if (battleActive) hideBattle();
+      updateXpHud(b);
+      return;
+    }
+    battleActive = true;
+    showBattle(b);
+  } catch(e){}
+}
+
+let _lastLevel = 1;
+function updateXpHud(b) {
+  if (b.player_level === undefined) return;
+  const lvl  = b.player_level;
+  const frac = b.xp_frac || 0;
+  document.getElementById('xp-level').textContent = `LV ${lvl}`;
+  document.getElementById('xp-bar-inner').style.width = (frac * 100).toFixed(1) + '%';
+  document.getElementById('xp-label').textContent = `${b.player_xp} / ${b.xp_next} XP`;
+  // Hit bonus preview: level hit bonus at max confidence edge (1.0) and level scale
+  const levelScale = Math.min(1.0, (lvl - 1) / 19.0);
+  const hitBonus   = Math.round(levelScale * 40);
+  document.getElementById('xp-bonus').textContent = `hit +${hitBonus}% max`;
+  // Level-up flash
+  if (lvl > _lastLevel) {
+    _lastLevel = lvl;
+    const el = document.getElementById('xp-level');
+    el.style.color = '#ffffff';
+    el.style.textShadow = '0 0 12px var(--yel)';
+    setTimeout(() => { el.style.color=''; el.style.textShadow=''; }, 1200);
+  }
+}
+
+function showBattle(b) {
+  const ov = document.getElementById('battle-overlay');
+  ov.style.display = 'flex';
+  // HP bars
+  document.getElementById('b-aname').textContent = b.agent.name;
+  document.getElementById('b-mname').textContent = b.mob.name;
+  const ahp = Math.max(0, b.agent.hp / b.agent.max_hp * 100);
+  const mhp = Math.max(0, b.mob.hp  / b.mob.max_hp  * 100);
+  document.getElementById('b-ahp').style.width  = ahp + '%';
+  document.getElementById('b-mhp').style.width  = mhp + '%';
+  document.getElementById('b-ahpv').textContent = `${Math.max(0,b.agent.hp)}/${b.agent.max_hp}`;
+  document.getElementById('b-mhpv').textContent = `${Math.max(0,b.mob.hp)}/${b.mob.max_hp}`;
+  // colour hp bar by health
+  document.getElementById('b-ahp').style.background =
+    ahp > 50 ? 'var(--yel)' : ahp > 25 ? 'var(--red)' : '#660011';
+  document.getElementById('b-mhp').style.background =
+    mhp > 50 ? 'var(--vio)' : mhp > 25 ? '#884488' : '#330033';
+  // Log
+  document.getElementById('battle-log').innerHTML =
+    b.log.map(l=>`<div>${l}</div>`).join('');
+  // No manual dismiss — auto-continues
+  if (b.finished) {
+    document.getElementById('battle-title').textContent =
+      b.winner === 'agent' ? '⚔ VICTORY!' : '💀 DEFEATED — NEW MAZE';
+    // Auto-dismiss after short delay so player can see result
+    setTimeout(async () => {
+      await fetch('/api/battle/dismiss', {method:'POST'});
+      hideBattle();
+    }, 1200);
+  }
+  updateXpHud(b);
+  // Draw arena canvas
+  drawBattleCanvas(b);
+}
+
+function hideBattle() {
+  battleActive = false;
+  _stallCount = 0; _lastSteps = -1;  // don't trip stall detector right after battle
+  document.getElementById('battle-overlay').style.display = 'none';
+  document.getElementById('battle-title').textContent = '⚔ DUNGEON ENCOUNTER';
+}
+
+async function dismissBattle() {
+  await fetch('/api/battle/dismiss', {method:'POST'});
+  hideBattle();
+}
+
+function drawBattleCanvas(b) {
+  const cv  = document.getElementById('battle-canvas');
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // dungeon floor grid
+  ctx.fillStyle = '#030d07';
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = '#0d2a18';
+  ctx.lineWidth = 1;
+  const GRID = 40;
+  for (let gx = 0; gx < W; gx += GRID) {
+    ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,H); ctx.stroke();
+  }
+  for (let gy = 0; gy < H; gy += GRID) {
+    ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(W,gy); ctx.stroke();
+  }
+
+  // corner torches
+  const torchColor = '#ff8822';
+  [[20,20],[W-20,20],[20,H-20],[W-20,H-20]].forEach(([tx,ty]) => {
+    ctx.beginPath();
+    const grad = ctx.createRadialGradient(tx,ty,1,tx,ty,18);
+    grad.addColorStop(0, '#ffcc44cc');
+    grad.addColorStop(1, 'transparent');
+    ctx.fillStyle = grad;
+    ctx.arc(tx, ty, 18, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = torchColor;
+    ctx.beginPath(); ctx.arc(tx,ty,3,0,Math.PI*2); ctx.fill();
+  });
+
+  // helper: draw fighter
+  function drawFighter(c, color_hex, label) {
+    const px = c.ax * W, py = c.ay * H;
+    const R = 18;
+
+    // glow
+    const glow = ctx.createRadialGradient(px,py,2,px,py,R*2.2);
+    glow.addColorStop(0, color_hex + 'aa');
+    glow.addColorStop(1, 'transparent');
+    ctx.beginPath(); ctx.arc(px,py,R*2.2,0,Math.PI*2);
+    ctx.fillStyle = glow; ctx.fill();
+
+    // hit flash ring
+    if (c.hit_flash > 0) {
+      ctx.beginPath(); ctx.arc(px,py,R+6,0,Math.PI*2);
+      ctx.strokeStyle = '#ff2244'; ctx.lineWidth = 3; ctx.stroke();
+    }
+    if (c.miss_flash > 0) {
+      ctx.beginPath(); ctx.arc(px,py,R+6,0,Math.PI*2);
+      ctx.strokeStyle = '#446655'; ctx.lineWidth = 2;
+      ctx.setLineDash([4,4]); ctx.stroke(); ctx.setLineDash([]);
+    }
+
+    // body
+    ctx.beginPath(); ctx.arc(px,py,R,0,Math.PI*2);
+    ctx.fillStyle = color_hex; ctx.fill();
+    ctx.strokeStyle = '#ffffff33'; ctx.lineWidth = 1.5; ctx.stroke();
+
+    // strike direction arrow
+    if (c.strike !== null) {
+      const srad = c.strike * Math.PI / 180;
+      const ex = px + Math.cos(srad)*32, ey = py - Math.sin(srad)*32;
+      ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(ex,ey);
+      ctx.strokeStyle = '#ff444488'; ctx.lineWidth = 2;
+      ctx.stroke();
+      // arrowhead
+      ctx.beginPath();
+      ctx.arc(ex,ey,4,0,Math.PI*2);
+      ctx.fillStyle = '#ff4444'; ctx.fill();
+    }
+
+    // dodge arc
+    if (c.dodge !== null) {
+      const drad = c.dodge * Math.PI / 180;
+      ctx.beginPath();
+      ctx.arc(px, py, R+10, drad - Math.PI/4, drad + Math.PI/4);
+      ctx.strokeStyle = '#00ff8866'; ctx.lineWidth = 2; ctx.stroke();
+    }
+
+    // label + conf
+    ctx.fillStyle = '#c8e8d8';
+    ctx.font = '8px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, px, py - R - 6);
+    ctx.fillText(`conf ${(c.conf*100).toFixed(0)}%`, px, py + R + 12);
+  }
+
+  drawFighter(b.agent, '#ffe055', b.agent.name);
+  drawFighter(b.mob,   '#cc44ff', b.mob.name);
+
+  // distance line
+  const ax = b.agent.ax*W, ay = b.agent.ay*H;
+  const mx = b.mob.ax*W,   my = b.mob.ay*H;
+  ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(mx,my);
+  ctx.strokeStyle = '#ffffff11'; ctx.lineWidth = 1;
+  ctx.setLineDash([3,6]); ctx.stroke(); ctx.setLineDash([]);
+
+  // cell location label
+  ctx.fillStyle = '#446655';
+  ctx.font = '8px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(`Cell (${b.cell.join(',')})  Tick ${b.tick}`, 6, H-6);
+}
+
+// ── Battle toggle ─────────────────────────────────────────
+let battlesEnabled = true;
+async function toggleBattles() {
+  battlesEnabled = !battlesEnabled;
+  await post('/api/battles/toggle', {enable: battlesEnabled});
+  const btn = document.getElementById('battle-toggle-btn');
+  if (battlesEnabled) {
+    btn.textContent = '⚔ Battles ON';
+    btn.style.borderColor = 'var(--vio)';
+    btn.style.color = 'var(--vio)';
+    btn.style.background = '';
+  } else {
+    btn.textContent = '⚔ Battles OFF';
+    btn.style.borderColor = 'var(--mut)';
+    btn.style.color = 'var(--mut)';
+    btn.style.background = 'rgba(0,0,0,.2)';
+  }
+}
+
+// ── Stress test ───────────────────────────────────────────
+let stressOn = false;
+let stressStatTimer = null;
+
+async function toggleStress() {
+  stressOn = !stressOn;
+  const btn = document.getElementById('stress-btn');
+  const r = await post('/api/stress', {enable: stressOn, workers: navigator.hardwareConcurrency || 4});
+  if (stressOn) {
+    btn.textContent = '🛑 Stop Stress';
+    btn.style.borderColor = 'var(--red)';
+    btn.style.color = 'var(--red)';
+    btn.style.background = 'rgba(255,34,68,.08)';
+    autoOn = true;
+    document.getElementById('abtn').textContent = '⏹ Stop';
+    stressStatTimer = setInterval(pollStressStats, 500);
+    setStatus(`Stress: ${r.workers} workers + main loop — no sleep`);
+  } else {
+    btn.textContent = '⚡ Stress Test';
+    btn.style.borderColor = '#ff6600';
+    btn.style.color = '#ff6600';
+    btn.style.background = '';
+    clearInterval(stressStatTimer);
+    document.getElementById('stress-info').textContent = 'CPU stress off';
+    setStatus('Stress test stopped.');
+  }
+}
+
+let _stressLastTotal = 0, _stressLastTime = Date.now();
+async function pollStressStats() {
+  try {
+    const s = await fetch('/api/stress/stats').then(r=>r.json());
+    const now = Date.now();
+    const dt  = (now - _stressLastTime) / 1000;
+    const rate = Math.round((s.total_steps - _stressLastTotal) / dt);
+    _stressLastTotal = s.total_steps;
+    _stressLastTime  = now;
+    document.getElementById('stress-info').textContent =
+      `${s.workers}w · ${s.total_steps.toLocaleString()} steps · ${rate.toLocaleString()}/s`;
+  } catch(e){}
+}
+
+// Poll battle every 180ms regardless of main poll rate
+startBattlePoll();
 
 // ── Init ──────────────────────────────────────────────────
 doReset();
